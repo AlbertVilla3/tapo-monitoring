@@ -11,7 +11,7 @@ Sistema ligero en Python pensado para ejecutarse cada 15 minutos mediante `cron`
 
 1. **Clonar el repositorio en `~/monitor_congelador`:**
    ```bash
-   git clone <URL_DE_TU_REPO> ~/monitor_congelador
+   git clone https://github.com/AlbertVilla3/tapo-monitoring.git ~/monitor_congelador
    cd ~/monitor_congelador
    ```
 
