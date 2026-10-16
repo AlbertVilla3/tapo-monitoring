@@ -1,0 +1,21 @@
+# Entorno virtual
+venv/
+.venv/
+ENV/
+
+# Credenciales y estado en runtime (NO subir a GitHub)
+.env
+state.json
+state.json.tmp
+*.log
+
+# Caché de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Sistema operativo / IDEs
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
