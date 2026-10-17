@@ -196,6 +196,11 @@ async def run_monitor(test_mode: bool = False) -> int:
         power_threshold_w = 5.0
 
     try:
+        energy_delta_threshold_kwh = float(os.getenv("ENERGY_DELTA_THRESHOLD_KWH", "0.003"))
+    except ValueError:
+        energy_delta_threshold_kwh = 0.003
+
+    try:
         max_inactive_seconds = int(os.getenv("MAX_INACTIVE_SECONDS", "7200"))
     except ValueError:
         max_inactive_seconds = 7200
@@ -269,8 +274,9 @@ async def run_monitor(test_mode: bool = False) -> int:
         current_power, today_energy = extract_energy_metrics(dev)
         last_energy = state.get("last_energy", -1.0)
 
-        # Control de reseteo a medianoche en today_energy
+        # Control de reseteo a medianoche e incremento real de energía (ignorando ~0.7W de standby)
         energy_increased = False
+        delta_energy = 0.0
         if today_energy is not None:
             if last_energy >= 0 and today_energy < last_energy:
                 logger.info(
@@ -278,9 +284,10 @@ async def run_monitor(test_mode: bool = False) -> int:
                     last_energy,
                     today_energy,
                 )
-                state["last_energy"] = today_energy
-            elif last_energy >= 0 and today_energy > last_energy:
-                energy_increased = True
+            elif last_energy >= 0:
+                delta_energy = round(today_energy - last_energy, 4)
+                if delta_energy >= energy_delta_threshold_kwh:
+                    energy_increased = True
 
             # Actualizamos siempre el último valor conocido de energía del día
             state["last_energy"] = today_energy
@@ -288,10 +295,11 @@ async def run_monitor(test_mode: bool = False) -> int:
         is_active = (current_power > power_threshold_w) or energy_increased
 
         logger.info(
-            "Lectura Tapo P110 -> Relé: %s | Potencia: %.2fW | Energía hoy: %s | Activo: %s",
+            "Lectura Tapo P110 -> Relé: %s | Potencia: %.2fW | Energía hoy: %s (Δ: +%.3f) | Activo: %s",
             "ON" if dev.is_on else "OFF",
             current_power,
             today_energy,
+            delta_energy,
             is_active,
         )
 
