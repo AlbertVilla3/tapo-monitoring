@@ -7,6 +7,8 @@ ENV/
 .env
 state.json
 state.json.tmp
+telegram_offset.json
+*.pid
 *.log
 
 # Caché de Python
