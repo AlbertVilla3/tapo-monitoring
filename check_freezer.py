@@ -196,9 +196,9 @@ async def run_monitor(test_mode: bool = False) -> int:
         power_threshold_w = 5.0
 
     try:
-        energy_delta_threshold_kwh = float(os.getenv("ENERGY_DELTA_THRESHOLD_KWH", "0.003"))
+        energy_delta_threshold_kwh = float(os.getenv("ENERGY_DELTA_THRESHOLD_KWH", "0.002"))
     except ValueError:
-        energy_delta_threshold_kwh = 0.003
+        energy_delta_threshold_kwh = 0.002
 
     try:
         max_inactive_seconds = int(os.getenv("MAX_INACTIVE_SECONDS", "7200"))
