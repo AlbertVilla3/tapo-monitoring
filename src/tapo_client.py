@@ -1,6 +1,6 @@
 """
-src/tapo_client.py - Cliente asíncrono robusto para TP-Link Tapo P110 con reconexión
-automática, exponential backoff y extracción de métricas de potencia y energía.
+src/tapo_client.py - Cliente asíncrono robusto para TP-Link Tapo P110 con protocolo KLAP,
+reconexión limpia por muestra y backoff exponencial para evitar expiración de sesión (403).
 """
 
 from __future__ import annotations
@@ -16,7 +16,8 @@ logger = logging.getLogger("fleck_monitor.tapo")
 class TapoP110Client:
     """
     Cliente asíncrono para interactuar con el enchufe inteligente Tapo P110.
-    Mantiene la sesión y reconecta automáticamente ante microcortes con backoff exponencial.
+    Utiliza sesiones limpias por muestra para evitar problemas de desfase de secuencia
+    o expiración de token en el protocolo KLAP de Tapo (HTTP 403 Forbidden).
     """
 
     def __init__(
@@ -32,43 +33,7 @@ class TapoP110Client:
         self.password: str = password
         self.initial_backoff_sec: float = initial_backoff_sec
         self.max_backoff_sec: float = max_backoff_sec
-
         self._current_backoff: float = initial_backoff_sec
-        self._dev: Any = None
-        self._is_connected: bool = False
-
-    async def connect(self) -> Any:
-        """
-        Intenta conectar con el Tapo P110 usando credenciales TP-Link (protocolo KLAP).
-        """
-        if not self.ip or not self.username or not self.password:
-            raise ValueError(
-                "Faltan credenciales del enchufe Tapo (TAPO_IP, TAPO_USERNAME o TAPO_PASSWORD)."
-            )
-
-        logger.debug("Conectando con Tapo P110 en %s...", self.ip)
-        dev = await Discover.discover_single(
-            self.ip,
-            username=self.username,
-            password=self.password,
-            timeout=10,
-        )
-        await dev.update()
-        self._dev = dev
-        self._is_connected = True
-        self._current_backoff = self.initial_backoff_sec
-        logger.info("Conexión establecida con Tapo P110 (%s). Relé: %s", self.ip, "ON" if dev.is_on else "OFF")
-        return dev
-
-    async def disconnect(self) -> None:
-        """Cierra la conexión y libera los recursos del cliente."""
-        if self._dev is not None and hasattr(self._dev, "disconnect"):
-            try:
-                await self._dev.disconnect()
-            except Exception as exc:
-                logger.debug("Aviso al desconectar Tapo: %s", exc)
-        self._dev = None
-        self._is_connected = False
 
     def _extract_metrics(self, dev: Any) -> Tuple[float, float, int, bool]:
         """
@@ -159,17 +124,21 @@ class TapoP110Client:
 
     async def get_sample(self) -> Dict[str, Any]:
         """
-        Obtiene una muestra de telemetría instantánea con reconexión automática
-        y backoff exponencial en caso de fallo de red.
+        Obtiene una muestra de telemetría instantánea. Realiza una conexión limpia y
+        cierra el socket tras la lectura para garantizar que el protocolo KLAP no sufra
+        desfases de secuencia (error 403 en lecturas subsecuentes).
         """
         while True:
+            dev = None
             try:
-                if self._dev is None or not self._is_connected:
-                    await self.connect()
-
-                # Actualizar estado del dispositivo
-                await self._dev.update()
-                power_w, current_a, today_energy_wh, is_on = self._extract_metrics(self._dev)
+                dev = await Discover.discover_single(
+                    self.ip,
+                    username=self.username,
+                    password=self.password,
+                    timeout=8,
+                )
+                await dev.update()
+                power_w, current_a, today_energy_wh, is_on = self._extract_metrics(dev)
 
                 # Reset de backoff tras lectura exitosa
                 self._current_backoff = self.initial_backoff_sec
@@ -183,11 +152,21 @@ class TapoP110Client:
 
             except Exception as exc:
                 logger.warning(
-                    "Error al muestrear Tapo P110 (%s): %s. Reintentando en %.1fs...",
+                    "Aviso de comunicación con Tapo P110 (%s): %s. Reintentando en %.1fs...",
                     self.ip,
                     exc,
                     self._current_backoff,
                 )
-                await self.disconnect()
                 await asyncio.sleep(self._current_backoff)
                 self._current_backoff = min(self._current_backoff * 2.0, self.max_backoff_sec)
+
+            finally:
+                if dev is not None and hasattr(dev, "disconnect"):
+                    try:
+                        await dev.disconnect()
+                    except Exception:
+                        pass
+
+    async def disconnect(self) -> None:
+        """Compatibilidad con interfaz de parada limpia."""
+        pass

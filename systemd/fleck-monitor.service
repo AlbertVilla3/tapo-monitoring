@@ -7,11 +7,12 @@ Wants=network-online.target
 Type=simple
 User=albertvilla
 WorkingDirectory=/home/albertvilla/monitor_congelador
+ExecStartPre=/bin/mkdir -p /home/albertvilla/monitor_congelador/data
 ExecStart=/home/albertvilla/monitor_congelador/venv/bin/python -m src.collector
 Restart=always
 RestartSec=10
-StandardOutput=append:/home/albertvilla/monitor_congelador/data/collector.log
-StandardError=append:/home/albertvilla/monitor_congelador/data/collector.log
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
