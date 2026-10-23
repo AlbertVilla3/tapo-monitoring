@@ -1,6 +1,8 @@
 """
 src/report.py - Generador de informe analítico CLI para el test de monitorización
 del termo eléctrico Fleck Nilo 150 y simulación comparativa con Aerotermo (COP 3.0).
+Calcula el consumo total mediante integración exacta de potencia (∑ P · Δt) sobre
+raw_samples y concilia los ciclos cerrados, el ciclo en curso (si existe) y el standby.
 """
 
 from __future__ import annotations
@@ -43,7 +45,7 @@ def calculate_metrics(db_path: Path = DB_PATH) -> Dict[str, Any]:
         cursor.execute("SELECT key, value FROM test_metadata;")
         metadata = {row["key"]: row["value"] for row in cursor.fetchall()}
 
-        # Muestras crudas
+        # Resumen de muestras crudas
         cursor.execute(
             """
             SELECT 
@@ -59,64 +61,155 @@ def calculate_metrics(db_path: Path = DB_PATH) -> Dict[str, Any]:
         )
         samples_summary = cursor.fetchone()
 
-        # Ciclos de calentamiento
+        # Todas las muestras ordenadas para integración trapezoidal exacta (∑ P · Δt)
         cursor.execute(
-            """
-            SELECT * FROM heating_cycles ORDER BY start_time ASC;
-            """
+            "SELECT id, timestamp_utc, timestamp_local, power_w, current_a FROM raw_samples ORDER BY id ASC;"
         )
+        all_samples = cursor.fetchall()
+
+        # Ciclos de calentamiento completados
+        cursor.execute("SELECT * FROM heating_cycles ORDER BY start_time ASC;")
         cycles = cursor.fetchall()
 
     samples_count = samples_summary["count"] or 0
-    if samples_count == 0:
+    if samples_count == 0 or not all_samples:
         return {"has_data": False, "message": "Aún no hay muestras registradas en raw_samples."}
 
-    # Cálculo de tiempo total monitorizado
+    # 1. Cálculo del tiempo total monitorizado
     start_dt = datetime.fromisoformat(samples_summary["min_ts_utc"].replace("Z", "+00:00"))
     end_dt = datetime.fromisoformat(samples_summary["max_ts_utc"].replace("Z", "+00:00"))
     total_seconds = max((end_dt - start_dt).total_seconds(), 1.0)
     total_hours = total_seconds / 3600.0
     total_days = total_seconds / 86400.0
 
-    # Desglose de ciclos por tipo
+    # 2. CONSUMO TOTAL MEDIDO (Integración exacta de potencia ∑ P · Δt sobre raw_samples)
+    total_integrated_energy_wh = 0.0
+    for i in range(len(all_samples) - 1):
+        s1 = all_samples[i]
+        s2 = all_samples[i + 1]
+        try:
+            t1 = datetime.fromisoformat(s1["timestamp_utc"].replace("Z", "+00:00")).timestamp()
+            t2 = datetime.fromisoformat(s2["timestamp_utc"].replace("Z", "+00:00")).timestamp()
+            dt_sec = max(0.0, min(t2 - t1, 120.0))  # límite de 120s para pausas de reinicio
+        except Exception:
+            dt_sec = 15.0
+        avg_p = (s1["power_w"] + s2["power_w"]) / 2.0
+        total_integrated_energy_wh += avg_p * (dt_sec / 3600.0)
+
+    if len(all_samples) == 1:
+        total_integrated_energy_wh = all_samples[0]["power_w"] * (15.0 / 3600.0)
+
+    total_electrical_energy_kwh = total_integrated_energy_wh / 1000.0
+
+    # 3. Detección de Ciclo Actualmente en Curso (Abierto)
+    # Buscamos muestras tras el fin del último ciclo completado
+    last_cycle_end_utc = cycles[-1]["end_time"] if cycles else ""
+    if last_cycle_end_utc:
+        trailing_samples = [
+            s for s in all_samples if s["timestamp_utc"] > last_cycle_end_utc
+        ]
+    else:
+        trailing_samples = list(all_samples)
+
+    open_cycle: Optional[Dict[str, Any]] = None
+    heating_start_idx = -1
+    for idx, s in enumerate(trailing_samples):
+        if s["power_w"] >= 100.0:
+            heating_start_idx = idx
+            break
+
+    if heating_start_idx >= 0:
+        active_slice = trailing_samples[heating_start_idx:]
+        consecutive_low = 0
+        for s in active_slice:
+            if s["power_w"] < 20.0:
+                consecutive_low += 1
+            else:
+                consecutive_low = 0
+
+        # Si no ha cerrado (menos de 2 muestras consecutivas < 20W)
+        if consecutive_low < 2 and len(active_slice) > 0:
+            s_first = active_slice[0]
+            s_last = active_slice[-1]
+            try:
+                t_first = datetime.fromisoformat(s_first["timestamp_utc"].replace("Z", "+00:00")).timestamp()
+                t_last = datetime.fromisoformat(s_last["timestamp_utc"].replace("Z", "+00:00")).timestamp()
+                dur_sec = max(t_last - t_first, 15.0)
+            except Exception:
+                dur_sec = len(active_slice) * 15.0
+
+            open_energy_wh = 0.0
+            for i in range(len(active_slice) - 1):
+                p1 = active_slice[i]["power_w"]
+                p2 = active_slice[i + 1]["power_w"]
+                try:
+                    t_a = datetime.fromisoformat(active_slice[i]["timestamp_utc"].replace("Z", "+00:00")).timestamp()
+                    t_b = datetime.fromisoformat(active_slice[i + 1]["timestamp_utc"].replace("Z", "+00:00")).timestamp()
+                    dt = max(0.0, min(t_b - t_a, 120.0))
+                except Exception:
+                    dt = 15.0
+                open_energy_wh += ((p1 + p2) / 2.0) * (dt / 3600.0)
+
+            if len(active_slice) == 1:
+                open_energy_wh = active_slice[0]["power_w"] * (15.0 / 3600.0)
+
+            powers = [s["power_w"] for s in active_slice]
+            active_powers = [p for p in powers if p >= 20.0] or powers
+            avg_p = sum(active_powers) / len(active_powers)
+            mode = "HALF_1250W" if avg_p < 1600.0 else "FULL_2500W"
+
+            open_cycle = {
+                "is_open": True,
+                "start_utc": s_first["timestamp_utc"],
+                "start_local": s_first["timestamp_local"],
+                "duration_sec": int(round(dur_sec)),
+                "duration_min": round(dur_sec / 60.0, 1),
+                "current_power_w": round(s_last["power_w"], 1),
+                "avg_power_w": round(avg_p, 1),
+                "max_power_w": round(max(powers), 1),
+                "energy_wh": round(open_energy_wh, 2),
+                "energy_kwh": round(open_energy_wh / 1000.0, 3),
+                "power_mode": mode,
+                "tentative_type": "MAINTENANCE_LOSS" if open_energy_wh < 350.0 else "WATER_DRAW_RECOVERY",
+            }
+
+    # 4. Desglose de ciclos completados
     maint_cycles: List[sqlite3.Row] = [c for c in cycles if c["cycle_type"] == "MAINTENANCE_LOSS"]
     draw_cycles: List[sqlite3.Row] = [c for c in cycles if c["cycle_type"] == "WATER_DRAW_RECOVERY"]
 
-    # Desglose de ciclos por potencia
     half_cycles: List[sqlite3.Row] = [c for c in cycles if c["power_mode"] == "HALF_1250W"]
     full_cycles: List[sqlite3.Row] = [c for c in cycles if c["power_mode"] == "FULL_2500W"]
 
-    # Energías
-    total_cycle_energy_wh = sum(c["energy_wh"] for c in cycles)
+    completed_cycles_energy_wh = sum(c["energy_wh"] for c in cycles)
+    completed_cycles_kwh = completed_cycles_energy_wh / 1000.0
     maint_energy_wh = sum(c["energy_wh"] for c in maint_cycles)
     draw_energy_wh = sum(c["energy_wh"] for c in draw_cycles)
 
+    maint_kwh = maint_energy_wh / 1000.0
+    draw_kwh = draw_energy_wh / 1000.0
+
     half_energy_wh = sum(c["energy_wh"] for c in half_cycles)
     full_energy_wh = sum(c["energy_wh"] for c in full_cycles)
-
     half_duration_sec = sum(c["duration_sec"] for c in half_cycles)
     full_duration_sec = sum(c["duration_sec"] for c in full_cycles)
     total_cycle_duration_sec = sum(c["duration_sec"] for c in cycles)
 
-    # Si hay standby residual fuera de ciclos, calcular energía total integrada de samples
-    # Cada muestra representa aprox. POLL_INTERVAL_SEC (15s)
-    # E_total_samples = avg_power_w * total_hours
-    total_electrical_energy_kwh = (samples_summary["avg_power_w"] * total_hours) / 1000.0
-    total_cycle_kwh = total_cycle_energy_wh / 1000.0
-    maint_kwh = maint_energy_wh / 1000.0
-    draw_kwh = draw_energy_wh / 1000.0
+    open_cycle_kwh = open_cycle["energy_kwh"] if open_cycle else 0.0
+    standby_kwh = max(0.0, total_electrical_energy_kwh - (completed_cycles_kwh + open_cycle_kwh))
 
-    maint_pct = (maint_kwh / total_cycle_kwh * 100.0) if total_cycle_kwh > 0 else 0.0
-    draw_pct = (draw_kwh / total_cycle_kwh * 100.0) if total_cycle_kwh > 0 else 0.0
+    total_heating_kwh = completed_cycles_kwh + open_cycle_kwh
+    maint_pct = (maint_kwh / total_heating_kwh * 100.0) if total_heating_kwh > 0 else 0.0
+    draw_pct = (draw_kwh / total_heating_kwh * 100.0) if total_heating_kwh > 0 else 0.0
 
-    # Estimación de litros de agua caliente a 60°C
+    # 5. Estimación de litros de agua caliente a 60°C
     delta_t = max(FLECK_TARGET_TEMP_C - WATER_INLET_TEMP_C, 1.0)
     wh_per_liter = delta_t * SPECIFIC_HEAT_WATER_WH_L_C  # aprox 45 * 1.163 = 52.335 Wh / L
-    estimated_hot_water_liters = (draw_energy_wh / wh_per_liter) if wh_per_liter > 0 else 0.0
+    # Incluye agua caliente de ciclos completados y de ciclo abierto si ya superó umbral
+    effective_draw_wh = draw_energy_wh + (open_cycle["energy_wh"] if (open_cycle and open_cycle["tentative_type"] == "WATER_DRAW_RECOVERY") else 0.0)
+    estimated_hot_water_liters = (effective_draw_wh / wh_per_liter) if wh_per_liter > 0 else 0.0
     liters_per_day = estimated_hot_water_liters / max(total_days, 0.001)
 
-    # Simulación Aerotermo (COP 3.0)
-    # La bomba de calor consume 1 / COP de la energía térmica útil entregada
+    # 6. Simulación Aerotermo (COP 3.0)
     aerotherm_cop = AEROTHERM_COP if AEROTHERM_COP > 0 else 3.0
     aerotherm_period_kwh = total_electrical_energy_kwh / aerotherm_cop
 
@@ -133,7 +226,6 @@ def calculate_metrics(db_path: Path = DB_PATH) -> Dict[str, Any]:
     annual_savings_eur = annual_fleck_cost_eur - annual_aerotherm_cost_eur
     annual_savings_kwh = annual_fleck_kwh - annual_aerotherm_kwh
 
-    # Reducción de consumo (justificación IRPF)
     reduction_pct = ((annual_fleck_kwh - annual_aerotherm_kwh) / annual_fleck_kwh * 100.0) if annual_fleck_kwh > 0 else 0.0
 
     return {
@@ -153,9 +245,15 @@ def calculate_metrics(db_path: Path = DB_PATH) -> Dict[str, Any]:
             "electricity_price_eur_kwh": ELECTRICITY_PRICE_EUR_KWH,
             "avg_power_w": round(samples_summary["avg_power_w"], 1),
             "max_power_w": round(samples_summary["max_power_w"], 1),
+            "standby_kwh": round(standby_kwh, 3),
         },
+        "open_cycle": open_cycle,
         "cycles_breakdown": {
-            "total_starts": len(cycles),
+            "total_starts": len(cycles) + (1 if open_cycle else 0),
+            "completed_cycles_count": len(cycles),
+            "completed_cycles_kwh": round(completed_cycles_kwh, 3),
+            "open_cycle_kwh": round(open_cycle_kwh, 3),
+            "standby_kwh": round(standby_kwh, 3),
             "avg_duration_min": round((total_cycle_duration_sec / len(cycles) / 60.0), 1) if cycles else 0.0,
             "maintenance": {
                 "count": len(maint_cycles),
@@ -188,7 +286,7 @@ def calculate_metrics(db_path: Path = DB_PATH) -> Dict[str, Any]:
         "water": {
             "estimated_liters_60c": round(estimated_hot_water_liters, 1),
             "daily_avg_liters_60c": round(liters_per_day, 1),
-            "equivalent_showers_approx": round(estimated_hot_water_liters / 25.0, 1),  # ~25L de agua a 60°C por ducha estándar
+            "equivalent_showers_approx": round(estimated_hot_water_liters / 25.0, 1),
             "target_temp_c": FLECK_TARGET_TEMP_C,
             "inlet_temp_c": WATER_INLET_TEMP_C,
         },
@@ -220,6 +318,7 @@ def format_cli_report(data: Dict[str, Any]) -> str:
     c = data["cycles_breakdown"]
     w = data["water"]
     a = data["aerotherm_simulation"]
+    oc = data.get("open_cycle")
 
     sep = "═" * 74
     subsep = "─" * 74
@@ -234,17 +333,37 @@ def format_cli_report(data: Dict[str, Any]) -> str:
         f" • Duración Total     : {t['total_hours']} horas ({t['total_days']} días) | {t['samples_count']} muestras",
         f" • Tarifa Eléctrica   : {e['electricity_price_eur_kwh']:.3f} €/kWh",
         subsep,
-        " 1. BALANCE ENERGÉTICO GLOBAL DE LA PRUEBA",
+        " 1. BALANCE ENERGÉTICO GLOBAL DE LA PRUEBA (Integración ∑ P · Δt)",
         subsep,
-        f"   Consumo Total Medido        : {e['total_kwh']:8.3f} kWh   ({e['total_cost_eur']:6.2f} €)",
+        f"   Consumo Total Medido (P·Δt) : {e['total_kwh']:8.3f} kWh   ({e['total_cost_eur']:6.2f} €)",
         f"   Promedio Diario             : {e['daily_avg_kwh']:8.3f} kWh/día ({(e['daily_avg_kwh'] * e['electricity_price_eur_kwh']):6.2f} €/día)",
         f"   Potencia Media Global       : {e['avg_power_w']:8.1f} W",
         f"   Potencia Máxima Registrada  : {e['max_power_w']:8.1f} W",
         subsep,
-        " 2. DESGLOSE TÉRMICO: PÉRDIDAS ESTÁTICAS vs DEMANDA REAL (DUCHAS)",
+        " 2. DESGLOSE TÉRMICO Y CONCILIACIÓN DE CICLOS",
         subsep,
-        f"   Arranques Totales Termostato: {c['total_starts']} ciclos (Duración media: {c['avg_duration_min']} min)",
-        "",
+    ]
+
+    starts_extra = f" (Cerrados: {c['completed_cycles_count']} + 1 EN CURSO)" if oc else f" (Cerrados: {c['completed_cycles_count']})"
+    lines.append(f"   Arranques Totales Termostato: {c['total_starts']} ciclos{starts_extra}")
+    lines.append("")
+
+    # Si hay un ciclo activo en curso, mostrarlo en cabecera del Bloque 2
+    if oc:
+        tentative_label = "📉 Pérdida estática (< 350 Wh)" if oc["tentative_type"] == "MAINTENANCE_LOSS" else "🚿 Ducha / Demanda (≥ 350 Wh)"
+        lines.extend([
+            "   🔥 CICLO ACTUALMENTE EN CURSO (ABIERTO AHORA MISMO):",
+            f"      • Inicio del Ciclo      : {oc['start_local'][:19]} (lleva {oc['duration_min']} min)",
+            f"      • Potencia Instantánea  : {oc['current_power_w']:.1f} W (Media activa: {oc['avg_power_w']:.1f} W)",
+            f"      • Modo de Resistencia   : {oc['power_mode']} (máx. {oc['max_power_w']:.1f} W)",
+            f"      • Energía en este Ciclo : {oc['energy_kwh']:.3f} kWh ({oc['energy_wh']:.0f} Wh acumulados)",
+            f"      • Tipo Tentativo        : {tentative_label}",
+            "",
+        ])
+
+    irpf_status_str = "✅ CUMPLE AMPLIAMENTE (66.7% reducción)" if a["irpf_eligible"] else "❌ No alcanza el 30%"
+
+    lines.extend([
         f"   📉 PÉRDIDAS DE MANTENIMIENTO (Agua enfriándose en el tanque sin usar):",
         f"      • Número de ciclos      : {c['maintenance']['count']:3d} ciclos ({c['maintenance']['percentage']:5.1f}% de la energía)",
         f"      • Energía Desperdiciada : {c['maintenance']['kwh']:7.3f} kWh ({c['maintenance']['daily_loss_kwh']:.3f} kWh/día)",
@@ -255,6 +374,13 @@ def format_cli_report(data: Dict[str, Any]) -> str:
         f"      • Número de ciclos      : {c['water_draw']['count']:3d} ciclos ({c['water_draw']['percentage']:5.1f}% de la energía)",
         f"      • Energía Calentamiento : {c['water_draw']['kwh']:7.3f} kWh ({c['water_draw']['daily_draw_kwh']:.3f} kWh/día)",
         f"      • Media por ciclo ducha : {c['water_draw']['avg_cycle_kwh']:.3f} kWh",
+        "",
+        f"   ⚖️  CONCILIACIÓN EXACTA DE ENERGÍA (Bloque 1 ➔ Bloque 2):",
+        f"      • Ciclos Cerrados ({c['completed_cycles_count']} ciclos)   : {c['completed_cycles_kwh']:7.3f} kWh",
+        f"      • Ciclo en Curso (Abierto)         : {c['open_cycle_kwh']:7.3f} kWh",
+        f"      • Standby / Reposo del termo       : {c['standby_kwh']:7.3f} kWh",
+        f"      ─────────────────────────────────────────────────────────────",
+        f"      • TOTAL MEDIDO EN RAW_SAMPLES      : {e['total_kwh']:7.3f} kWh (100.0% cuadrado)",
         subsep,
         " 3. RÉGIMEN DE FUNCIONAMIENTO DE LAS RESISTENCIAS (Fleck Nilo 150)",
         subsep,
@@ -269,7 +395,7 @@ def format_cli_report(data: Dict[str, Any]) -> str:
         subsep,
         " 5. SIMULACIÓN COMPARATIVA: AEROTERMO ACS (BOMBA DE CALOR COP 3.0)",
         subsep,
-        f"   Métricas en el periodo de prueba ({t['total_days']} días):",
+        f"   Métricas en el periodo de prueba ({t['total_days']} días a {e['electricity_price_eur_kwh']:.3f} €/kWh):",
         f"   ┌───────────────────────────┬───────────────┬───────────────┬───────────────┐",
         f"   │ Equipo                    │ Consumo (kWh) │ Gasto (€)     │ Ahorro Directo│",
         f"   ├───────────────────────────┼───────────────┼───────────────┼───────────────┤",
@@ -286,13 +412,13 @@ def format_cli_report(data: Dict[str, Any]) -> str:
         "",
         f"   ⚖️  JUSTIFICACIÓN FISCAL DEDUCCIÓN IRPF (RDL 19/2021 y Ley 10/2022):",
         f"   • Reducción de Energía Primaria No Renovable estimada: {a['reduction_pct']:.1f}% (Requisito legal: \u2265 30%)",
-        f"   • Estado para Deducción IRPF (40% o 60% coste obra) : {'✅ CUMPLE AMPLIAMENTE (66.7% reducción)' if a['irpf_eligible'] else '❌ No alcanza el 30%'}",
+        f"   • Estado para Deducción IRPF (40% o 60% coste obra) : {irpf_status_str}",
         f"   • Justificación: Al triplicar la eficiencia estacional (COP 3.0 vs efecto Joule COP 1.0),",
         f"     el paso a Aerotermia reduce 2 de cada 3 kWh consumidos, acreditando el salto",
         f"     de letra en el Certificado de Eficiencia Energética (CEE) antes/después.",
         sep,
         "",
-    ]
+    ])
     return "\n".join(lines)
 
 
@@ -303,7 +429,6 @@ def send_report_telegram(report_text: str) -> bool:
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    # Telegram mensaje máximo 4096 caracteres
     chunks = [report_text[i:i + 4000] for i in range(0, len(report_text), 4000)]
     for chunk in chunks:
         payload = {

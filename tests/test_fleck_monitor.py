@@ -152,3 +152,37 @@ def test_report_calculations(temp_db: Path):
     assert "FLECK NILO 150" in txt
     assert "AEROTERMO" in txt
     assert "IRPF" in txt
+    assert "CONCILIACIÓN EXACTA DE ENERGÍA" in txt
+
+
+def test_report_with_open_cycle(temp_db: Path):
+    # Simulated run with a completed cycle followed by an open heating cycle currently running at 1340W
+    insert_raw_sample("2026-10-23T10:00:00Z", "2026-10-23T12:00:00+02:00", 3.0, 0.01, 0, temp_db)
+    insert_heating_cycle(
+        start_time="2026-10-23T10:10:00Z",
+        end_time="2026-10-23T10:30:00Z",
+        duration_sec=1200,
+        energy_wh=400.0,
+        avg_power_w=1200.0,
+        max_power_w=1250.0,
+        power_mode="HALF_1250W",
+        cycle_type="WATER_DRAW_RECOVERY",
+        db_path=temp_db,
+    )
+    # Standby after completed cycle
+    insert_raw_sample("2026-10-23T10:35:00Z", "2026-10-23T12:35:00+02:00", 3.0, 0.01, 400, temp_db)
+    # Start of open cycle currently active
+    insert_raw_sample("2026-10-23T11:00:00Z", "2026-10-23T13:00:00+02:00", 1340.0, 5.8, 400, temp_db)
+    insert_raw_sample("2026-10-23T11:00:15Z", "2026-10-23T13:00:15+02:00", 1345.0, 5.8, 405, temp_db)
+    insert_raw_sample("2026-10-23T11:00:30Z", "2026-10-23T13:00:30+02:00", 1342.0, 5.8, 411, temp_db)
+
+    metrics = calculate_metrics(temp_db)
+    assert metrics["open_cycle"] is not None
+    assert metrics["open_cycle"]["is_open"] is True
+    assert metrics["open_cycle"]["current_power_w"] == 1342.0
+    assert metrics["open_cycle"]["power_mode"] == "HALF_1250W"
+    assert metrics["cycles_breakdown"]["total_starts"] == 2  # 1 completed + 1 in progress
+
+    txt = format_cli_report(metrics)
+    assert "CICLO ACTUALMENTE EN CURSO (ABIERTO AHORA MISMO)" in txt
+    assert "CONCILIACIÓN EXACTA DE ENERGÍA" in txt

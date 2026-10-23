@@ -47,7 +47,7 @@ def _get_int_env(key: str, default: int) -> int:
 
 POLL_INTERVAL_SEC: int = _get_int_env("POLL_INTERVAL_SEC", 15)
 TEST_DURATION_DAYS: int = _get_int_env("TEST_DURATION_DAYS", 3)
-ELECTRICITY_PRICE_EUR_KWH: float = _get_float_env("ELECTRICITY_PRICE_EUR_KWH", 0.16)
+ELECTRICITY_PRICE_EUR_KWH: float = _get_float_env("ELECTRICITY_PRICE_EUR_KWH", 0.245)
 AEROTHERM_COP: float = _get_float_env("AEROTHERM_COP", 3.0)
 
 # Parámetros térmicos e hidráulicos (Fleck Nilo 150)
