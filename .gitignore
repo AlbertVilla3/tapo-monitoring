@@ -10,6 +10,10 @@ state.json.tmp
 telegram_offset.json
 *.pid
 *.log
+data/
+*.db
+*.db-wal
+*.db-shm
 
 # Caché de Python
 __pycache__/

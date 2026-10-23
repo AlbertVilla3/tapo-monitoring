@@ -1,0 +1,17 @@
+[Unit]
+Description=Monitor Temporal Termo Fleck Nilo 150 (Tapo P110)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=albertvilla
+WorkingDirectory=/home/albertvilla/monitor_congelador
+ExecStart=/home/albertvilla/monitor_congelador/venv/bin/python -m src.collector
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/albertvilla/monitor_congelador/data/collector.log
+StandardError=append:/home/albertvilla/monitor_congelador/data/collector.log
+
+[Install]
+WantedBy=multi-user.target
