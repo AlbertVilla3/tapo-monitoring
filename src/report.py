@@ -28,7 +28,7 @@ from src.config import (
     TELEGRAM_TOKEN,
     WATER_INLET_TEMP_C,
 )
-from src.db import get_db_connection
+from src.db import deduplicate_cycles, get_db_connection, init_db
 
 
 def calculate_metrics(db_path: Path = DB_PATH) -> Dict[str, Any]:
@@ -37,6 +37,10 @@ def calculate_metrics(db_path: Path = DB_PATH) -> Dict[str, Any]:
         raise FileNotFoundError(
             f"No se encontró la base de datos en '{db_path}'. Asegúrate de haber iniciado src.collector primero."
         )
+
+    # Saneamiento proactivo de la base de datos (eliminar duplicados y asegurar esquema único)
+    init_db(db_path)
+    deduplicate_cycles(db_path)
 
     with get_db_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -68,12 +72,23 @@ def calculate_metrics(db_path: Path = DB_PATH) -> Dict[str, Any]:
         all_samples = cursor.fetchall()
 
         # Ciclos de calentamiento completados
-        cursor.execute("SELECT * FROM heating_cycles ORDER BY start_time ASC;")
-        cycles = cursor.fetchall()
+        cursor.execute("SELECT * FROM heating_cycles ORDER BY start_time ASC, id ASC;")
+        raw_cycles = cursor.fetchall()
 
     samples_count = samples_summary["count"] or 0
     if samples_count == 0 or not all_samples:
         return {"has_data": False, "message": "Aún no hay muestras registradas en raw_samples."}
+
+    # Saneamiento y eliminación de solapamientos en memoria
+    cycles: List[sqlite3.Row] = []
+    seen_starts = set()
+    for c in raw_cycles:
+        if c["start_time"] in seen_starts:
+            continue
+        if cycles and c["start_time"] < cycles[-1]["end_time"]:
+            continue
+        seen_starts.add(c["start_time"])
+        cycles.append(c)
 
     # 1. Cálculo del tiempo total monitorizado
     start_dt = datetime.fromisoformat(samples_summary["min_ts_utc"].replace("Z", "+00:00"))

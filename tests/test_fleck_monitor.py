@@ -186,3 +186,40 @@ def test_report_with_open_cycle(temp_db: Path):
     txt = format_cli_report(metrics)
     assert "CICLO ACTUALMENTE EN CURSO (ABIERTO AHORA MISMO)" in txt
     assert "CONCILIACIÓN EXACTA DE ENERGÍA" in txt
+
+
+def test_deduplication_and_uniqueness(temp_db: Path):
+    from src.db import deduplicate_cycles, get_all_cycles
+
+    # Insert initial cycle
+    insert_heating_cycle(
+        start_time="2026-10-23T20:18:41Z",
+        end_time="2026-10-23T20:23:26Z",
+        duration_sec=285,
+        energy_wh=104.0,
+        avg_power_w=1310.0,
+        max_power_w=1350.0,
+        power_mode="HALF_1250W",
+        cycle_type="MAINTENANCE_LOSS",
+        db_path=temp_db,
+    )
+    # Attempt duplicate insert with same start_time (should update, not duplicate)
+    insert_heating_cycle(
+        start_time="2026-10-23T20:18:41Z",
+        end_time="2026-10-23T20:23:26Z",
+        duration_sec=285,
+        energy_wh=104.0,
+        avg_power_w=1310.0,
+        max_power_w=1350.0,
+        power_mode="HALF_1250W",
+        cycle_type="MAINTENANCE_LOSS",
+        db_path=temp_db,
+    )
+
+    cycles = get_all_cycles(temp_db)
+    assert len(cycles) == 1
+    assert cycles[0]["energy_wh"] == 104.0
+
+    # Test deduplicate_cycles helper
+    deleted = deduplicate_cycles(temp_db)
+    assert deleted == 0

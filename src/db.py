@@ -35,8 +35,44 @@ def get_db_connection(db_path: Path = DB_PATH) -> Generator[sqlite3.Connection, 
         conn.close()
 
 
+def deduplicate_cycles(db_path: Path = DB_PATH) -> int:
+    """
+    Elimina registros duplicados o solapados en heating_cycles manteniendo el primer registro.
+    Devuelve la cantidad de registros eliminados.
+    """
+    with get_db_connection(db_path) as conn:
+        cursor = conn.cursor()
+        # 1. Eliminar duplicados exactos por start_time (conservar id menor)
+        cursor.execute(
+            """
+            DELETE FROM heating_cycles
+            WHERE id NOT IN (
+                SELECT MIN(id) FROM heating_cycles GROUP BY start_time
+            );
+            """
+        )
+        deleted = cursor.rowcount
+
+        # 2. Eliminar registros solapados si los hubiera
+        cursor.execute("SELECT id, start_time, end_time FROM heating_cycles ORDER BY start_time ASC, id ASC;")
+        rows = cursor.fetchall()
+        to_delete = []
+        last_end = ""
+        for r in rows:
+            if last_end and r["start_time"] < last_end:
+                to_delete.append(r["id"])
+            else:
+                last_end = r["end_time"]
+
+        if to_delete:
+            cursor.executemany("DELETE FROM heating_cycles WHERE id = ?;", [(i,) for i in to_delete])
+            deleted += len(to_delete)
+
+        return deleted
+
+
 def init_db(db_path: Path = DB_PATH) -> None:
-    """Inicializa el esquema de tablas si no existen."""
+    """Inicializa el esquema de tablas si no existen y sanea registros duplicados."""
     with get_db_connection(db_path) as conn:
         cursor = conn.cursor()
 
@@ -57,12 +93,12 @@ def init_db(db_path: Path = DB_PATH) -> None:
             "CREATE INDEX IF NOT EXISTS idx_raw_samples_ts ON raw_samples(timestamp_utc);"
         )
 
-        # Tabla de ciclos de calentamiento detectados
+        # Tabla de ciclos de calentamiento detectados con restricción UNIQUE en start_time
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS heating_cycles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                start_time TEXT NOT NULL,
+                start_time TEXT NOT NULL UNIQUE,
                 end_time TEXT NOT NULL,
                 duration_sec INTEGER NOT NULL,
                 energy_wh REAL NOT NULL,
@@ -73,8 +109,17 @@ def init_db(db_path: Path = DB_PATH) -> None:
             );
             """
         )
+        # Saneamiento de duplicados en bases de datos existentes
         cursor.execute(
-            "CREATE INDEX IF NOT EXISTS idx_heating_cycles_start ON heating_cycles(start_time);"
+            """
+            DELETE FROM heating_cycles
+            WHERE id NOT IN (
+                SELECT MIN(id) FROM heating_cycles GROUP BY start_time
+            );
+            """
+        )
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_heating_cycles_start ON heating_cycles(start_time);"
         )
 
         # Tabla de metadatos de la prueba (inicio, fin, estado)
@@ -121,7 +166,7 @@ def insert_heating_cycle(
     cycle_type: str,
     db_path: Path = DB_PATH,
 ) -> int:
-    """Inserta un ciclo de calentamiento concluido."""
+    """Inserta o actualiza un ciclo de calentamiento concluido (idempotente con ON CONFLICT)."""
     with get_db_connection(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -129,7 +174,15 @@ def insert_heating_cycle(
             INSERT INTO heating_cycles (
                 start_time, end_time, duration_sec, energy_wh,
                 avg_power_w, max_power_w, power_mode, cycle_type
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(start_time) DO UPDATE SET
+                end_time = excluded.end_time,
+                duration_sec = excluded.duration_sec,
+                energy_wh = excluded.energy_wh,
+                avg_power_w = excluded.avg_power_w,
+                max_power_w = excluded.max_power_w,
+                power_mode = excluded.power_mode,
+                cycle_type = excluded.cycle_type;
             """,
             (
                 start_time,
@@ -143,6 +196,14 @@ def insert_heating_cycle(
             ),
         )
         return cursor.lastrowid or 0
+
+
+def get_last_heating_cycle(db_path: Path = DB_PATH) -> Optional[sqlite3.Row]:
+    """Obtiene el último ciclo registrado en heating_cycles."""
+    with get_db_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM heating_cycles ORDER BY start_time DESC LIMIT 1;")
+        return cursor.fetchone()
 
 
 def get_metadata(key: str, default: Optional[str] = None, db_path: Path = DB_PATH) -> Optional[str]:
@@ -193,3 +254,10 @@ def get_first_and_last_sample_timestamps(db_path: Path = DB_PATH) -> Tuple[Optio
         if row and row["first_ts"]:
             return row["first_ts"], row["last_ts"]
         return None, None
+
+
+if __name__ == "__main__":
+    import sys
+    init_db()
+    deleted = deduplicate_cycles()
+    print(f"Base de datos saneada e inicializada en {DB_PATH}. Ciclos duplicados/solapados eliminados: {deleted}")

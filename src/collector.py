@@ -41,6 +41,7 @@ from src.config import (
     WATER_INLET_TEMP_C,
 )
 from src.db import (
+    get_last_heating_cycle,
     get_metadata,
     init_db,
     insert_heating_cycle,
@@ -85,13 +86,14 @@ class CycleStateMachine:
       cortes espurios por conmutación de tanque o resistencia.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, last_cycle_end_utc: str | None = None) -> None:
         self.is_heating: bool = False
         self.start_utc: str = ""
         self.start_local: str = ""
         self.start_timestamp: float = 0.0
         self.consecutive_low_samples: int = 0
         self.samples: list[tuple[float, float, float]] = []  # (ts, power_w, current_a)
+        self.last_cycle_end_utc: str = last_cycle_end_utc or ""
 
     def on_sample(
         self,
@@ -107,6 +109,8 @@ class CycleStateMachine:
         """
         # Estado REPOSO (IDLE)
         if not self.is_heating:
+            if self.last_cycle_end_utc and ts_utc <= self.last_cycle_end_utc:
+                return None
             if power_w >= CYCLE_START_POWER_W:
                 self.is_heating = True
                 self.start_utc = ts_utc
@@ -221,10 +225,12 @@ class CycleStateMachine:
             return None
         now_dt_utc = datetime.now(timezone.utc)
         now_dt_local = datetime.now(MADRID_TZ)
-        return self._finalize_cycle(
+        cycle = self._finalize_cycle(
             end_utc=now_dt_utc.isoformat(),
             end_local=now_dt_local.isoformat(),
         )
+        self._reset()
+        return cycle
 
 
 class FleckMonitorCollector:
@@ -246,6 +252,12 @@ class FleckMonitorCollector:
     async def run(self) -> None:
         """Ejecuta el loop periódico de adquisición."""
         init_db()
+
+        # Recuperar el último ciclo registrado para evitar arranques solapados en reinicios
+        last_cycle = get_last_heating_cycle()
+        if last_cycle:
+            self.state_machine.last_cycle_end_utc = last_cycle["end_time"]
+            logger.info("Último ciclo registrado concluido en: %s", last_cycle["end_time"])
 
         # Registrar o recuperar metadatos del test
         test_start_str = get_metadata("test_start_utc")
