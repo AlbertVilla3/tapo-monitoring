@@ -77,6 +77,8 @@ def seed_history_from_cron_log() -> Tuple[List[float], Dict[str, float], Dict[st
                 day_str, hour_str, _relay, power_str, energy_str = m.groups()
                 power_w = float(power_str)
                 energy_kwh = float(energy_str)
+                if power_w > 400.0:
+                    continue
                 hour_key = f"{day_str} {hour_str}"
 
                 recent_readings.append(power_w)
@@ -133,10 +135,33 @@ def load_state(now: float) -> Dict[str, Any]:
                 "recent_readings": list(recent_readings or [])[-MAX_RECENT_READINGS:],
                 "hourly_buckets": dict(list((hourly_buckets or {}).items())[-MAX_HOURLY_BUCKETS:]),
                 "daily_buckets": dict(list((daily_buckets or {}).items())[-MAX_DAILY_BUCKETS:]),
+                "energy_offset_day": str(data.get("energy_offset_day", "")),
+                "energy_offset_kwh": float(data.get("energy_offset_kwh", 0.0) or 0.0),
+                "awaiting_freezer_handover": bool(data.get("awaiting_freezer_handover", False)),
             }
     except Exception as exc:
         logger.warning("No se pudo leer %s (%s). Reiniciando estado.", STATE_FILE, exc)
         return default_state
+
+
+def get_effective_today_energy(
+    state: Dict[str, Any], day_key: str, raw_today_energy: Optional[float]
+) -> Optional[float]:
+    """
+    Descuenta el consumo previo acumulado ese mismo día por otro aparato (ej. termo)
+    cuando el enchufe Tapo P110 se reasigna de vuelta al congelador.
+    """
+    if raw_today_energy is None:
+        return None
+    offset_day = str(state.get("energy_offset_day", "") or "")
+    offset_kwh = float(state.get("energy_offset_kwh", 0.0) or 0.0)
+    if offset_day == day_key and offset_kwh > 0.0:
+        if raw_today_energy < offset_kwh:
+            # El enchufe reinició su contador interno al desenchufarse
+            state["energy_offset_kwh"] = 0.0
+            return round(raw_today_energy, 4)
+        return round(max(0.0, raw_today_energy - offset_kwh), 4)
+    return round(raw_today_energy, 4)
 
 
 def save_state(state: Dict[str, Any]) -> None:
@@ -323,9 +348,10 @@ async def build_live_status_report(
 
     hourly_buckets: Dict[str, float] = dict(state.get("hourly_buckets", {}))
     daily_buckets: Dict[str, float] = dict(state.get("daily_buckets", {}))
-    if today_energy is not None:
-        day_key = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
-        daily_buckets[day_key] = round(today_energy, 4)
+    day_key = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+    effective_today = get_effective_today_energy(state, day_key, today_energy)
+    if effective_today is not None and current_power <= 400.0:
+        daily_buckets[day_key] = effective_today
 
     hourly_kwh = list(hourly_buckets.values())
     daily_kwh = list(daily_buckets.values())
@@ -339,9 +365,10 @@ async def build_live_status_report(
 
     inactive_mins = 0 if current_power >= 5.0 else int((now - state["last_active_ts"]) // 60)
     max_mins = int(max_inactive_seconds // 60)
+    shown_today = effective_today if effective_today is not None else today_energy
     extra_lines = [
         "--- Diagnóstico Operativo ---",
-        f"Consumo hoy (Tapo)  : {today_energy if today_energy is not None else 'N/A'} kWh",
+        f"Consumo hoy (Congel.): {shown_today if shown_today is not None else 'N/A'} kWh",
         f"Tiempo sin motor    : {inactive_mins} min (Umbral alerta: {max_mins} min)",
     ]
     return report + "\n" + "\n".join(extra_lines)
@@ -510,8 +537,8 @@ async def run_telegram_listener() -> int:
 
                 load_dotenv(dotenv_path=ENV_FILE, override=True)
                 tapo_ip = os.getenv("TAPO_IP", "").strip()
-                tapo_user = os.getenv("TAPO_USER", "").strip()
-                tapo_pass = os.getenv("TAPO_PASS", "").strip()
+                tapo_user = (os.getenv("TAPO_USER") or os.getenv("TAPO_USERNAME") or "").strip()
+                tapo_pass = (os.getenv("TAPO_PASS") or os.getenv("TAPO_PASSWORD") or "").strip()
                 try:
                     max_inactive_seconds = int(os.getenv("MAX_INACTIVE_SECONDS", "4500"))
                 except ValueError:
@@ -533,13 +560,72 @@ async def run_telegram_listener() -> int:
             await asyncio.sleep(5)
 
 
+async def prepare_freezer_transition() -> int:
+    """
+    Prepara state.json y el listener antes de mover físicamente el Tapo P110
+    desde el termo de vuelta al congelador, aislando el contador diario previo.
+    """
+    load_dotenv(dotenv_path=ENV_FILE)
+    tapo_ip = os.getenv("TAPO_IP", "").strip()
+    tapo_user = (os.getenv("TAPO_USER") or os.getenv("TAPO_USERNAME") or "").strip()
+    tapo_pass = (os.getenv("TAPO_PASS") or os.getenv("TAPO_PASSWORD") or "").strip()
+
+    now = time.time()
+    today_str = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+    state = load_state(now)
+
+    # Limpiar posibles lecturas residuales de alta potencia (>400W) del termo
+    state["recent_readings"] = [
+        float(p) for p in state.get("recent_readings", []) if float(p) <= 400.0
+    ]
+    state["daily_buckets"] = {
+        k: v
+        for k, v in state.get("daily_buckets", {}).items()
+        if float(v) <= 3.5 and k != today_str
+    }
+
+    baseline_kwh = 0.0
+    dev = None
+    if tapo_ip and tapo_user and tapo_pass:
+        try:
+            dev = await connect_tapo(tapo_ip, tapo_user, tapo_pass, retries=1)
+            _power, raw_today = extract_energy_metrics(dev)
+            if raw_today is not None and raw_today > 0:
+                baseline_kwh = round(float(raw_today), 4)
+        except Exception as exc:
+            logger.info("No se pudo leer contador previo del Tapo (puede estar desenchufado): %s", exc)
+        finally:
+            if dev is not None and hasattr(dev, "disconnect"):
+                try:
+                    await dev.disconnect()
+                except Exception:
+                    pass
+
+    state["last_active_ts"] = now
+    state["alert_sent"] = False
+    state["last_energy"] = 0.0
+    state["energy_offset_day"] = today_str
+    state["energy_offset_kwh"] = baseline_kwh
+    state["awaiting_freezer_handover"] = True
+    save_state(state)
+
+    if os.name != "nt":
+        ensure_listener_running()
+
+    print(
+        f"✅ Estado del congelador preparado en {STATE_FILE.name} "
+        f"(Offset energía hoy {today_str}: {baseline_kwh:.3f} kWh descontados del termo)."
+    )
+    return 0
+
+
 async def run_monitor(test_mode: bool = False, status_mode: bool = False) -> int:
     """Ejecuta el flujo principal de monitorización, el modo estado (--status) o el modo test (--test)."""
     load_dotenv(dotenv_path=ENV_FILE)
 
     tapo_ip = os.getenv("TAPO_IP", "").strip()
-    tapo_user = os.getenv("TAPO_USER", "").strip()
-    tapo_pass = os.getenv("TAPO_PASS", "").strip()
+    tapo_user = (os.getenv("TAPO_USER") or os.getenv("TAPO_USERNAME") or "").strip()
+    tapo_pass = (os.getenv("TAPO_PASS") or os.getenv("TAPO_PASSWORD") or "").strip()
     telegram_token = os.getenv("TELEGRAM_TOKEN", "").strip()
     telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
@@ -635,7 +721,28 @@ async def run_monitor(test_mode: bool = False, status_mode: bool = False) -> int
             send_telegram_message(telegram_token, telegram_chat_id, relay_msg)
 
         # 3. Lectura de Consumo (Detección de botón del congelador apagado)
-        current_power, today_energy = extract_energy_metrics(dev)
+        current_power, raw_today_energy = extract_energy_metrics(dev)
+        day_key = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+
+        # Si está esperando el cambio físico del termo al congelador y detecta >400W (resistencia termo),
+        # actualizar el offset de energía y omitir registro para no contaminar el histórico del congelador.
+        if state.get("awaiting_freezer_handover"):
+            if current_power > 400.0:
+                logger.info(
+                    "Esperando desconexión del termo (detectados %.1fW > 400W). Actualizando offset diario...",
+                    current_power,
+                )
+                state["energy_offset_day"] = day_key
+                if raw_today_energy is not None:
+                    state["energy_offset_kwh"] = round(float(raw_today_energy), 4)
+                state["last_energy"] = 0.0
+                state["last_active_ts"] = now
+                save_state(state)
+                return 0
+            else:
+                state["awaiting_freezer_handover"] = False
+
+        today_energy = get_effective_today_energy(state, day_key, raw_today_energy)
         last_energy = state.get("last_energy", -1.0)
 
         # Control de reseteo a medianoche e incremento real de energía (ignorando ~0.7W de standby)
@@ -725,9 +832,16 @@ def main() -> None:
         action="store_true",
         help="Inicia el listener ligero para responder al instante a comandos en Telegram (/estado, /consumo).",
     )
+    parser.add_argument(
+        "--prepare-freezer",
+        action="store_true",
+        help="Prepara state.json, descuenta la energía acumulada hoy por otro equipo y arranca el listener.",
+    )
     args = parser.parse_args()
     if args.listen:
         exit_code = asyncio.run(run_telegram_listener())
+    elif args.prepare_freezer:
+        exit_code = asyncio.run(prepare_freezer_transition())
     else:
         exit_code = asyncio.run(run_monitor(test_mode=args.test, status_mode=args.status))
     sys.exit(exit_code)

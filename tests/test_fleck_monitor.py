@@ -223,3 +223,67 @@ def test_deduplication_and_uniqueness(temp_db: Path):
     # Test deduplicate_cycles helper
     deleted = deduplicate_cycles(temp_db)
     assert deleted == 0
+
+
+def test_cold_archive_export(temp_db: Path, tmp_path: Path):
+    from src.archive_report import export_cold_archive
+
+    # Día 1 y Día 2 con muestras y ciclos
+    insert_raw_sample("2026-10-24T06:00:00Z", "2026-10-24T08:00:00+02:00", 1320.0, 5.7, 0, temp_db)
+    insert_raw_sample("2026-10-24T06:00:15Z", "2026-10-24T08:00:15+02:00", 1325.0, 5.7, 5, temp_db)
+    insert_raw_sample("2026-10-25T07:00:00Z", "2026-10-25T08:00:00+01:00", 2.5, 0.01, 10, temp_db)
+
+    insert_heating_cycle(
+        start_time="2026-10-24T06:00:00Z",
+        end_time="2026-10-24T06:30:00Z",
+        duration_sec=1800,
+        energy_wh=660.0,
+        avg_power_w=1320.0,
+        max_power_w=1350.0,
+        power_mode="HALF_1250W",
+        cycle_type="WATER_DRAW_RECOVERY",
+        db_path=temp_db,
+    )
+    insert_heating_cycle(
+        start_time="2026-10-25T03:00:00Z",
+        end_time="2026-10-25T03:08:00Z",
+        duration_sec=480,
+        energy_wh=175.0,
+        avg_power_w=1312.0,
+        max_power_w=1330.0,
+        power_mode="HALF_1250W",
+        cycle_type="MAINTENANCE_LOSS",
+        db_path=temp_db,
+    )
+
+    out_dir = tmp_path / "cold_archive_test"
+    bundle = export_cold_archive(db_path=temp_db, archive_dir=out_dir)
+
+    assert bundle["html_path"].exists()
+    assert bundle["md_path"].exists()
+    assert bundle["txt_path"].exists()
+    assert bundle["json_path"].exists()
+    assert bundle["daily_csv_path"].exists()
+    assert bundle["cycles_csv_path"].exists()
+    assert bundle["frozen_db_path"].exists()
+
+    html_content = bundle["html_path"].read_text(encoding="utf-8")
+    assert "<svg" in html_content
+    assert "Fleck Nilo 150" in html_content
+    assert "2026-10-24" in html_content
+
+
+def test_freezer_transition_energy_offset():
+    from check_freezer import get_effective_today_energy
+
+    # Caso 1: Tapo conserva en flash el consumo previo del termo (4.200 kWh)
+    state = {"energy_offset_day": "2026-11-01", "energy_offset_kwh": 4.200}
+    assert get_effective_today_energy(state, "2026-11-01", 4.215) == 0.015
+
+    # Caso 2: Al día siguiente (medianoche) ya no aplica el offset del día anterior
+    assert get_effective_today_energy(state, "2026-11-02", 0.120) == 0.120
+
+    # Caso 3: El enchufe reseteó su contador a 0 al desenchufarlo físicamente
+    state_reset = {"energy_offset_day": "2026-11-01", "energy_offset_kwh": 4.200}
+    assert get_effective_today_energy(state_reset, "2026-11-01", 0.025) == 0.025
+    assert state_reset["energy_offset_kwh"] == 0.0

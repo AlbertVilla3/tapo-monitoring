@@ -11,6 +11,7 @@ telegram_offset.json
 *.pid
 *.log
 data/
+archive/
 *.db
 *.db-wal
 *.db-shm

@@ -486,6 +486,13 @@ def main() -> None:
         action="store_true",
         help="Envía el informe formateado directamente al chat de Telegram configurado.",
     )
+    parser.add_argument(
+        "--archive",
+        nargs="?",
+        const="",
+        default=None,
+        help="Genera paquete completo en frío (HTML offline con gráficas, Markdown, CSVs, JSON y copia congelada SQLite).",
+    )
     args = parser.parse_args()
 
     try:
@@ -493,6 +500,20 @@ def main() -> None:
     except Exception as exc:
         print(f"Error calculando métricas: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    if args.archive is not None:
+        from src.archive_report import export_cold_archive
+
+        target_dir = Path(args.archive) if args.archive else None
+        bundle = export_cold_archive(db_path=args.db, archive_dir=target_dir)
+        print(f"\n📦 PAQUETE HISTÓRICO EN FRÍO GENERADO EN:\n   {bundle['archive_dir']}")
+        print(f"   • HTML Interactivo / PDF : {bundle['html_path'].name}")
+        print(f"   • Informe Markdown       : {bundle['md_path'].name}")
+        print(f"   • Resumen Consola TXT    : {bundle['txt_path'].name}")
+        print(f"   • Desglose Diario CSV    : {bundle['daily_csv_path'].name}")
+        print(f"   • Historial Ciclos CSV   : {bundle['cycles_csv_path'].name}")
+        print(f"   • Métricas JSON          : {bundle['json_path'].name}")
+        print(f"   • Base SQLite Congelada  : {bundle['frozen_db_path'].name}")
 
     if args.json:
         print(json.dumps(data, indent=2, ensure_ascii=False))
