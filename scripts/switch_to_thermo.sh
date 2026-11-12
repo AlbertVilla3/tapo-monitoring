@@ -64,7 +64,7 @@ sleep 1
 
 # Si systemd está disponible con fleck-monitor
 STARTED_BY_SYSTEMD=false
-if systemctl list-unit-files 2>/dev/null | grep -q "fleck-monitor.service"; then
+if systemctl cat fleck-monitor.service >/dev/null 2>&1 || [ -f /etc/systemd/system/fleck-monitor.service ]; then
     echo "--> Activando servicio systemd fleck-monitor..."
     sudo systemctl daemon-reload || true
     sudo systemctl enable fleck-monitor || true
