@@ -33,6 +33,7 @@ from src.config import (
     SPECIFIC_HEAT_WATER_WH_L_C,
     TELEGRAM_CHAT_ID,
     TELEGRAM_TOKEN,
+    WATER_HEATER_NAME,
     WATER_INLET_TEMP_C,
 )
 from src.db import deduplicate_cycles, get_db_connection, init_db
@@ -178,7 +179,12 @@ def calculate_metrics(db_path: Path = DB_PATH) -> Dict[str, Any]:
             powers = [s["power_w"] for s in active_slice]
             active_powers = [p for p in powers if p >= 20.0] or powers
             avg_p = sum(active_powers) / len(active_powers)
-            mode = "HALF_1250W" if avg_p < 1600.0 else "FULL_2500W"
+            if avg_p < 800.0:
+                mode = "HEAT_PUMP_ECO"
+            elif avg_p < 1600.0:
+                mode = "HALF_1250W"
+            else:
+                mode = "FULL_2500W"
 
             open_cycle = {
                 "is_open": True,
@@ -199,6 +205,7 @@ def calculate_metrics(db_path: Path = DB_PATH) -> Dict[str, Any]:
     maint_cycles: List[sqlite3.Row] = [c for c in cycles if c["cycle_type"] == "MAINTENANCE_LOSS"]
     draw_cycles: List[sqlite3.Row] = [c for c in cycles if c["cycle_type"] == "WATER_DRAW_RECOVERY"]
 
+    eco_cycles: List[sqlite3.Row] = [c for c in cycles if c["power_mode"] == "HEAT_PUMP_ECO"]
     half_cycles: List[sqlite3.Row] = [c for c in cycles if c["power_mode"] == "HALF_1250W"]
     full_cycles: List[sqlite3.Row] = [c for c in cycles if c["power_mode"] == "FULL_2500W"]
 
@@ -210,8 +217,10 @@ def calculate_metrics(db_path: Path = DB_PATH) -> Dict[str, Any]:
     maint_kwh = maint_energy_wh / 1000.0
     draw_kwh = draw_energy_wh / 1000.0
 
+    eco_energy_wh = sum(c["energy_wh"] for c in eco_cycles)
     half_energy_wh = sum(c["energy_wh"] for c in half_cycles)
     full_energy_wh = sum(c["energy_wh"] for c in full_cycles)
+    eco_duration_sec = sum(c["duration_sec"] for c in eco_cycles)
     half_duration_sec = sum(c["duration_sec"] for c in half_cycles)
     full_duration_sec = sum(c["duration_sec"] for c in full_cycles)
     total_cycle_duration_sec = sum(c["duration_sec"] for c in cycles)
@@ -293,6 +302,11 @@ def calculate_metrics(db_path: Path = DB_PATH) -> Dict[str, Any]:
                 "avg_cycle_kwh": round((draw_kwh / len(draw_cycles)), 3) if draw_cycles else 0.0,
             },
             "power_modes": {
+                "heat_pump_eco": {
+                    "count": len(eco_cycles),
+                    "total_min": round(eco_duration_sec / 60.0, 1),
+                    "kwh": round(eco_energy_wh / 1000.0, 3),
+                },
                 "half_1250w": {
                     "count": len(half_cycles),
                     "total_min": round(half_duration_sec / 60.0, 1),
@@ -344,12 +358,13 @@ def format_cli_report(data: Dict[str, Any]) -> str:
 
     sep = "═" * 74
     subsep = "─" * 74
+    device_name = (data.get("metadata", {}).get("device_name") or WATER_HEATER_NAME).strip()
 
     lines = [
         "",
         sep,
-        "   📊 INFORME DE MONITORIZACIÓN: TERMO ELÉCTRICO FLECK NILO 150 (60°C)",
-        "           Prueba Temporal de Rendimiento, Demanda y Aerotermia",
+        f"   📊 INFORME DE MONITORIZACIÓN: {device_name.upper()}",
+        "           Prueba de Rendimiento, Demanda y Comparativa",
         sep,
         f" • Periodo Evaluado   : {t['start_local'][:19]} ➔ {t['end_local'][:19]}",
         f" • Duración Total     : {t['total_hours']} horas ({t['total_days']} días) | {t['samples_count']} muestras",
@@ -404,10 +419,11 @@ def format_cli_report(data: Dict[str, Any]) -> str:
         f"      ─────────────────────────────────────────────────────────────",
         f"      • TOTAL MEDIDO EN RAW_SAMPLES      : {e['total_kwh']:7.3f} kWh (100.0% cuadrado)",
         subsep,
-        " 3. RÉGIMEN DE FUNCIONAMIENTO DE LAS RESISTENCIAS (Fleck Nilo 150)",
+        f" 3. RÉGIMEN DE FUNCIONAMIENTO DE POTENCIA ({device_name})",
         subsep,
-        f"   • Modo Resistencia 1.250 W : {c['power_modes']['half_1250w']['count']:3d} veces | {c['power_modes']['half_1250w']['total_min']:6.1f} min | {c['power_modes']['half_1250w']['kwh']:6.3f} kWh",
-        f"   • Modo Doble Res. 2.500 W  : {c['power_modes']['full_2500w']['count']:3d} veces | {c['power_modes']['full_2500w']['total_min']:6.1f} min | {c['power_modes']['full_2500w']['kwh']:6.3f} kWh",
+        f"   • Bomba de Calor ECO (<800W) : {c['power_modes']['heat_pump_eco']['count']:3d} veces | {c['power_modes']['heat_pump_eco']['total_min']:6.1f} min | {c['power_modes']['heat_pump_eco']['kwh']:6.3f} kWh",
+        f"   • Resistencia 1.250 W / Apoyo: {c['power_modes']['half_1250w']['count']:3d} veces | {c['power_modes']['half_1250w']['total_min']:6.1f} min | {c['power_modes']['half_1250w']['kwh']:6.3f} kWh",
+        f"   • Resistencia 2.500 W / Boost: {c['power_modes']['full_2500w']['count']:3d} veces | {c['power_modes']['full_2500w']['total_min']:6.1f} min | {c['power_modes']['full_2500w']['kwh']:6.3f} kWh",
         subsep,
         " 4. BALANCE HIDRÁULICO ESTIMADO",
         subsep,

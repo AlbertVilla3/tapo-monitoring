@@ -17,7 +17,7 @@ ENV_FILE: Path = BASE_DIR / ".env"
 load_dotenv(dotenv_path=ENV_FILE)
 
 # Dispositivo y BD activa
-WATER_HEATER_NAME: str = os.getenv("WATER_HEATER_NAME", "Nuevo Termo / Aerotermo").strip()
+WATER_HEATER_NAME: str = os.getenv("WATER_HEATER_NAME", "Aerotermo Kosner KCA V4.2 100L").strip()
 DB_FILE_NAME: str = os.getenv("WATER_HEATER_DB", "new_water_heater_test.db").strip()
 DB_PATH: Path = DATA_DIR / DB_FILE_NAME
 BASELINE_DB_PATH: Path = DATA_DIR / "fleck_monitor_test.db"
