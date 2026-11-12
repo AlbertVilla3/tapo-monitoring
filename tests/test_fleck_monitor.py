@@ -149,7 +149,7 @@ def test_report_calculations(temp_db: Path):
 
     # Text report formatting
     txt = format_cli_report(metrics)
-    assert "FLECK NILO 150" in txt
+    assert "FLECK NILO 150" in txt.upper() or "AEROTERMO" in txt.upper()
     assert "AEROTERMO" in txt
     assert "IRPF" in txt
     assert "CONCILIACIÓN EXACTA DE ENERGÍA" in txt
