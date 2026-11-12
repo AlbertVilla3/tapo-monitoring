@@ -34,7 +34,7 @@ fi
 
 # 1.2 Detener servicios systemd del congelador si existieran
 for svc in check_freezer freezer-monitor monitor-congelador; do
-    if systemctl list-unit-files 2>/dev/null | grep -q "^${svc}\.service"; then
+    if systemctl list-unit-files 2>/dev/null | grep -q "${svc}\.service"; then
         echo "--> Deteniendo servicio $svc..."
         sudo systemctl stop "$svc" || true
         sudo systemctl disable "$svc" || true

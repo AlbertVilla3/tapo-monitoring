@@ -73,7 +73,7 @@ fi
 
 # Si existía algún servicio systemd previo del congelador deshabilitado, reactivarlo
 for svc in check_freezer freezer-monitor monitor-congelador; do
-    if systemctl list-unit-files 2>/dev/null | grep -q "^${svc}\.service"; then
+    if systemctl list-unit-files 2>/dev/null | grep -q "${svc}\.service"; then
         echo "--> Reactivando servicio systemd detectado: $svc"
         sudo systemctl enable "$svc" || true
         sudo systemctl start "$svc" || true
