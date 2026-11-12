@@ -13,9 +13,9 @@ else
     PYTHON_BIN="python3"
 fi
 
-echo "=== Lanzando Monitor Fleck Nilo 150 ==="
+echo "=== Lanzando Monitor de Termo / Aerotermo ==="
 echo "Directorio: $PROJECT_DIR"
 echo "Python    : $PYTHON_BIN"
-echo "Base datos: $PROJECT_DIR/data/fleck_monitor_test.db"
+echo "Base datos: $PROJECT_DIR/data"
 
 exec "$PYTHON_BIN" -m src.collector

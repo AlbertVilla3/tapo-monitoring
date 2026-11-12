@@ -38,11 +38,12 @@ echo "✅ Colector del termo detenido limpiamente."
 
 echo ""
 echo "=========================================================================="
-echo " 2. GENERANDO INFORME HISTÓRICO EN FRÍO (ARCHIVO PERMANENTE)"
+echo " 2. GENERANDO INFORME HISTÓRICO EN FRÍO Y COMPARATIVA"
 echo "=========================================================================="
-"$VENV_PYTHON" -m src.report --archive "$@"
+"$VENV_PYTHON" -m src.report --archive "$@" || true
+"$VENV_PYTHON" -m src.compare_report "$@" || true
 
-ARCHIVE_LATEST="$(ls -dt "$PROJECT_DIR"/archive/fleck_nilo_* 2>/dev/null | head -n 1 || true)"
+ARCHIVE_LATEST="$(ls -dt "$PROJECT_DIR"/archive/* 2>/dev/null | head -n 1 || true)"
 
 echo ""
 echo "=========================================================================="

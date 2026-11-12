@@ -829,16 +829,19 @@ def export_cold_archive(
     if archive_dir is None:
         start_tag = str(data["time"]["start_local"])[:10].replace("-", "")
         end_tag = str(data["time"]["end_local"])[:10].replace("-", "")
-        archive_dir = db_path.resolve().parent.parent / "archive" / f"fleck_nilo_{start_tag}_{end_tag}"
+        dev_tag = "fleck_nilo" if "fleck" in db_path.name.lower() else "nuevo_termo"
+        archive_dir = db_path.resolve().parent.parent / "archive" / f"{dev_tag}_{start_tag}_{end_tag}"
 
     archive_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. HTML interactivo / imprimible a PDF
-    html_path = archive_dir / "INFORME_HISTORICO_FLECK_NILO_150.html"
+    html_name = "INFORME_HISTORICO_FLECK_NILO_150.html" if "fleck" in db_path.name.lower() else "INFORME_HISTORICO_NUEVO_TERMO.html"
+    html_path = archive_dir / html_name
     html_path.write_text(format_html_archive(data), encoding="utf-8")
 
     # 2. Markdown completo
-    md_path = archive_dir / "INFORME_HISTORICO_FLECK_NILO_150.md"
+    md_name = "INFORME_HISTORICO_FLECK_NILO_150.md" if "fleck" in db_path.name.lower() else "INFORME_HISTORICO_NUEVO_TERMO.md"
+    md_path = archive_dir / md_name
     md_path.write_text(format_markdown_archive(data), encoding="utf-8")
 
     # 3. Informe texto plano tipo consola
@@ -897,7 +900,8 @@ def export_cold_archive(
             writer.writerow({k: row.get(k) for k in cycle_fields})
 
     # 7. Copia congelada e íntegra de SQLite (consolidando WAL con backup nativo)
-    frozen_db_path = archive_dir / "fleck_monitor_test_frozen.db"
+    frozen_db_name = "fleck_monitor_test_frozen.db" if "fleck" in db_path.name.lower() else f"{db_path.stem}_frozen.db"
+    frozen_db_path = archive_dir / frozen_db_name
     if frozen_db_path.exists():
         frozen_db_path.unlink()
     src_conn = sqlite3.connect(str(db_path), timeout=30.0)

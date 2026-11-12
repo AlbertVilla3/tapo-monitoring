@@ -104,7 +104,7 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 energy_wh REAL NOT NULL,
                 avg_power_w REAL NOT NULL,
                 max_power_w REAL NOT NULL,
-                power_mode TEXT NOT NULL CHECK(power_mode IN ('HALF_1250W', 'FULL_2500W')),
+                power_mode TEXT NOT NULL,
                 cycle_type TEXT NOT NULL CHECK(cycle_type IN ('MAINTENANCE_LOSS', 'WATER_DRAW_RECOVERY'))
             );
             """

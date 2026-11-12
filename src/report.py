@@ -15,6 +15,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import requests
 
 from src.config import (
@@ -493,7 +500,21 @@ def main() -> None:
         default=None,
         help="Genera paquete completo en frío (HTML offline con gráficas, Markdown, CSVs, JSON y copia congelada SQLite).",
     )
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help="Muestra la comparativa de rendimiento y ahorro respecto al termo anterior (Fleck Nilo 150).",
+    )
     args = parser.parse_args()
+
+    if args.compare:
+        from src.compare_report import build_comparison, format_comparison_cli
+        comp_data = build_comparison(new_db_path=args.db)
+        comp_text = format_comparison_cli(comp_data)
+        print(comp_text)
+        if args.telegram:
+            send_report_telegram(comp_text)
+        return
 
     try:
         data = calculate_metrics(args.db)

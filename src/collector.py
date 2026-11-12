@@ -38,6 +38,7 @@ from src.config import (
     TELEGRAM_CHAT_ID,
     TELEGRAM_TOKEN,
     TEST_DURATION_DAYS,
+    WATER_HEATER_NAME,
     WATER_INLET_TEMP_C,
 )
 from src.db import (
@@ -181,9 +182,15 @@ class CycleStateMachine:
         avg_power_w = sum(active_samples) / len(active_samples)
 
         # Determinar modo de potencia
-        # < 1600W -> HALF_1250W (una resistencia activa)
-        # >= 1600W -> FULL_2500W (ambas resistencias activas)
-        power_mode = "HALF_1250W" if avg_power_w < POWER_MODE_THRESHOLD_W else "FULL_2500W"
+        # < 800W -> HEAT_PUMP_ECO (aerotermo / bomba de calor ~300-650W)
+        # 800W - 1600W -> HALF_1250W (resistencia media / medio tanque)
+        # >= 1600W -> FULL_2500W (modo boost / doble resistencia)
+        if avg_power_w < 800.0:
+            power_mode = "HEAT_PUMP_ECO"
+        elif avg_power_w < POWER_MODE_THRESHOLD_W:
+            power_mode = "HALF_1250W"
+        else:
+            power_mode = "FULL_2500W"
 
         # Clasificación heurística
         # MAINTENANCE_LOSS si < 350 Wh O si ocurre en ventana nocturna 01:30-06:30
@@ -268,27 +275,31 @@ class FleckMonitorCollector:
             set_metadata("test_start_utc", now_utc.isoformat())
             set_metadata("test_start_local", now_local.isoformat())
             set_metadata("test_duration_days", str(TEST_DURATION_DAYS))
+            set_metadata("device_name", WATER_HEATER_NAME)
             set_metadata("status", "RUNNING")
-            logger.info("🚀 Iniciando NUEVO test de monitorización para Fleck Nilo 150.")
+            logger.info("🚀 Iniciando NUEVO test de monitorización para: %s", WATER_HEATER_NAME)
             send_telegram_alert(
-                f"🚀 [Fleck Nilo 150] Test iniciado.\n"
+                f"🚀 [{WATER_HEATER_NAME}] Test iniciado.\n"
                 f"Duración prevista: {TEST_DURATION_DAYS} días.\n"
                 f"Muestreo cada {POLL_INTERVAL_SEC}s. Enchufe Tapo: {TAPO_IP}"
             )
             test_start_dt = now_utc
         else:
             test_start_dt = datetime.fromisoformat(test_start_str.replace("Z", "+00:00"))
+            active_name = get_metadata("device_name", WATER_HEATER_NAME)
             logger.info(
-                "Reanudando test de Fleck Nilo 150 iniciado el %s (UTC).",
+                "Reanudando test de %s iniciado el %s (UTC).",
+                active_name,
                 test_start_dt.strftime("%Y-%m-%d %H:%M:%S"),
             )
 
         test_duration_seconds = TEST_DURATION_DAYS * 86400.0
         test_completed_notified = False
 
-        logger.info("=== Monitor Fleck Nilo 150 Activo ===")
+        active_device = get_metadata("device_name", WATER_HEATER_NAME)
+        logger.info("=== Monitor %s Activo ===", active_device)
         logger.info("IP Tapo P110: %s | Intervalo: %ds", TAPO_IP, POLL_INTERVAL_SEC)
-        logger.info("Base de datos: data/fleck_monitor_test.db")
+        logger.info("Base de datos: data/%s", DB_PATH.name)
 
         while not self._stop_event.is_set():
             loop_start = time.time()
@@ -303,9 +314,11 @@ class FleckMonitorCollector:
                 test_completed_notified = True
                 set_metadata("status", "COMPLETED")
                 msg = (
-                    f"🏁 [Fleck Nilo 150] ¡Periodo de prueba completado ({TEST_DURATION_DAYS} días)!\n"
-                    f"El colector sigue registrando datos de fondo. "
-                    f"Ejecuta en tu terminal:\n`python -m src.report` para ver el informe final."
+                    f"🏁 [{active_device}] ¡Periodo de prueba completado ({TEST_DURATION_DAYS} días)!\n"
+                    f"El colector sigue registrando datos de fondo.\n"
+                    f"Ejecuta en tu terminal:\n"
+                    f" • `python -m src.report` para ver el informe detallado.\n"
+                    f" • `python -m src.compare_report` para comparar con el termo anterior."
                 )
                 logger.info(msg)
                 send_telegram_alert(msg)

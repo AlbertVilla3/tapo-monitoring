@@ -287,3 +287,59 @@ def test_freezer_transition_energy_offset():
     state_reset = {"energy_offset_day": "2026-11-01", "energy_offset_kwh": 4.200}
     assert get_effective_today_energy(state_reset, "2026-11-01", 0.025) == 0.025
     assert state_reset["energy_offset_kwh"] == 0.0
+
+
+def test_state_machine_heat_pump_cycle():
+    sm = CycleStateMachine()
+
+    # Inicio de ciclo con bomba de calor a 480W
+    sm.on_sample(100.0, "2026-11-12T10:00:00Z", "2026-11-12T11:00:00+01:00", 480.0, 2.1)
+    assert sm.is_heating
+
+    # Ciclo activo de 1 hora (485 Wh >= 350 Wh umbral demanda)
+    sm.on_sample(3700.0, "2026-11-12T11:00:00Z", "2026-11-12T12:00:00+01:00", 490.0, 2.1)
+
+    # Fin de ciclo por 2 lecturas < 20W
+    sm.on_sample(3715.0, "2026-11-12T11:00:15Z", "2026-11-12T12:00:15+01:00", 4.0, 0.02)
+    c = sm.on_sample(3730.0, "2026-11-12T11:00:30Z", "2026-11-12T12:00:30+01:00", 3.8, 0.02)
+
+    assert c is not None
+    assert c["power_mode"] == "HEAT_PUMP_ECO"
+    assert c["cycle_type"] == "WATER_DRAW_RECOVERY"
+
+
+def test_compare_report(temp_db: Path):
+    from src.compare_report import build_comparison, format_comparison_cli, format_comparison_html
+
+    # Simular datos del nuevo termo (consumiendo ~1.8 kWh/día con compresor a 450W)
+    insert_raw_sample("2026-11-12T00:00:00Z", "2026-11-12T01:00:00+01:00", 4.0, 0.02, 0, temp_db)
+    insert_raw_sample("2026-11-12T06:00:00Z", "2026-11-12T07:00:00+01:00", 480.0, 2.1, 0, temp_db)
+    insert_raw_sample("2026-11-12T08:00:00Z", "2026-11-12T09:00:00+01:00", 480.0, 2.1, 960, temp_db)
+    insert_raw_sample("2026-11-12T23:59:59Z", "2026-11-13T00:59:59+01:00", 4.0, 0.02, 1800, temp_db)
+
+    insert_heating_cycle(
+        start_time="2026-11-12T06:00:00Z",
+        end_time="2026-11-12T08:00:00Z",
+        duration_sec=7200,
+        energy_wh=960.0,
+        avg_power_w=480.0,
+        max_power_w=520.0,
+        power_mode="HEAT_PUMP_ECO",
+        cycle_type="WATER_DRAW_RECOVERY",
+        db_path=temp_db,
+    )
+
+    comp = build_comparison(new_db_path=temp_db)
+    assert comp["has_new_data"] is True
+    assert comp["comparison"]["real_cop"] > 2.0
+    assert comp["comparison"]["reduction_pct"] > 50.0
+    assert comp["comparison"]["irpf_eligible"] is True
+
+    cli_text = format_comparison_cli(comp)
+    assert "COMPARATIVO" in cli_text
+    assert "Fleck Nilo 150" in cli_text
+    assert "COP" in cli_text
+
+    html_text = format_comparison_html(comp)
+    assert "<svg" in html_text
+    assert "Fleck Nilo 150" in html_text
